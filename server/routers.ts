@@ -15,7 +15,7 @@ import {
   dadosPagamentoManual,
   pagamentoRecursoManualSchema,
 } from "./recursoPagamentoManual";
-import { importarDecisoesGlosaPlanilha } from "./importDecisoesGlosaPlanilhaService";
+import { erroSeguroImportacaoDecisoes, importarDecisoesGlosaPlanilha } from "./importDecisoesGlosaPlanilhaService";
 import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { sdk } from "./_core/sdk";
@@ -2585,6 +2585,7 @@ export const appRouter = router({
           estabelecimentoId: z.number(),
           convenioId: z.number().optional(),
           aplicar: z.boolean().default(false),
+          tokenPrevia: z.string().regex(/^[0-9a-f]{64}$/).nullish(),
           linhas: z
             .array(
               z.object({
@@ -2619,13 +2620,18 @@ export const appRouter = router({
             input.aplicar ? "editar" : "visualizar"
           );
         }
-        return importarDecisoesGlosaPlanilha({
-          estabelecimentoId: input.estabelecimentoId,
-          convenioId: input.convenioId,
-          linhas: input.linhas,
-          aplicar: input.aplicar,
-          userId: ctx.user.id,
-        });
+        try {
+          return await importarDecisoesGlosaPlanilha({
+            estabelecimentoId: input.estabelecimentoId,
+            convenioId: input.convenioId,
+            linhas: input.linhas,
+            aplicar: input.aplicar,
+            tokenPrevia: input.tokenPrevia,
+            userId: ctx.user.id,
+          });
+        } catch (e) {
+          throw erroSeguroImportacaoDecisoes(e);
+        }
       }),
 
     // Sugerir classificação com base no histórico

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 import { toast } from "sonner";
 import { CheckCircle2, FileSpreadsheet, Loader2, ThumbsDown, ThumbsUp, Upload, XCircle } from "lucide-react";
@@ -22,6 +22,15 @@ import {
   localizarCabecalhoDecisoes,
   type ResultadoExtracaoDecisoes,
 } from "../../../../shared/planilhaDecisoesGlosa";
+import {
+  escopoDaSelecao,
+  exigeNovaAnalise,
+  mensagemErroSegura,
+  previaAplicavel,
+  respostaAindaValida,
+  type EscopoImportacaoDecisoes,
+  type PreviaImportacaoDecisoes,
+} from "@/lib/importarDecisoesGlosaPrevia";
 
 type Props = {
   open: boolean;
@@ -68,84 +77,157 @@ export function ImportarDecisoesGlosaDialog({
   const [inputKey, setInputKey] = useState(0);
 
   const mutation = trpc.recursos.importarDecisoesPlanilha.useMutation();
-  const previa = mutation.data && mutation.data.aplicados === 0 ? mutation.data : null;
+  type DadosPrevia = NonNullable<typeof mutation.data>;
+  const [previaEstado, setPreviaEstado] = useState<PreviaImportacaoDecisoes<DadosPrevia, ResultadoExtracaoDecisoes["linhas"]> | null>(null);
+
+  const ocupado = lendo || mutation.isPending;
+  const escopoAtual = escopoDaSelecao(estabelecimentoId, convenio);
+  // Refs: respostas assíncronas comparam com o escopo/sequência vigentes, não com o closure antigo.
+  const escopoAtualRef = useRef<EscopoImportacaoDecisoes | null>(escopoAtual);
+  escopoAtualRef.current = escopoAtual;
+  const seqRef = useRef(0);
+
+  /** Invalida a prévia e qualquer resposta de análise ainda em voo. */
+  const invalidarPrevia = () => {
+    seqRef.current += 1;
+    setPreviaEstado(null);
+  };
 
   const resetar = () => {
+    invalidarPrevia();
     setArquivoNome("");
     setAba("");
     setExtracao(null);
+    setLendo(false);
+    setConvenio(convenioInicial ?? "todos");
     setInputKey((k) => k + 1);
     mutation.reset();
   };
 
-  const montarPayload = (aplicar: boolean) => ({
-    estabelecimentoId: estabelecimentoId!,
-    convenioId: convenio !== "todos" ? parseInt(convenio) : undefined,
-    aplicar,
-    linhas: extracao!.linhas,
-  });
+  // Troca de hospital ou convênio: a prévia anterior deixa de valer imediatamente.
+  useEffect(() => {
+    invalidarPrevia();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [estabelecimentoId, convenio]);
+
+  // Convênio selecionado que não pertence mais à lista (ex.: trocou o hospital) volta para "todos".
+  useEffect(() => {
+    if (convenio !== "todos" && convenios && !convenios.some((c) => String(c.id) === convenio)) setConvenio("todos");
+  }, [convenios, convenio]);
+
+  // Fechamento externo (ou por Cancelar) não deixa estado antigo para a próxima abertura.
+  useEffect(() => {
+    if (!open) resetar();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const analisar = async (linhas: ResultadoExtracaoDecisoes["linhas"], escopo: EscopoImportacaoDecisoes) => {
+    const seq = ++seqRef.current;
+    setPreviaEstado(null);
+    try {
+      const dados = await mutation.mutateAsync({
+        estabelecimentoId: escopo.estabelecimentoId,
+        convenioId: escopo.convenioId ?? undefined,
+        aplicar: false,
+        linhas,
+      });
+      // Resposta atrasada de outro escopo/análise é descartada.
+      if (!respostaAindaValida(seq, seqRef.current, escopo, escopoAtualRef.current)) return;
+      setPreviaEstado({ seq, escopo, linhas, tokenPrevia: dados.tokenPrevia, dados });
+    } catch (e) {
+      if (seq !== seqRef.current) return;
+      toast.error(mensagemErroSegura(e, "Não foi possível analisar a planilha. Tente novamente."));
+    }
+  };
 
   const handleArquivo = async (file: File | undefined) => {
-    if (!file || !estabelecimentoId) return;
+    const escopo = escopoAtualRef.current;
+    if (!file || !escopo) return;
+    invalidarPrevia();
     mutation.reset();
     setLendo(true);
     setArquivoNome(file.name);
+    let lida: Awaited<ReturnType<typeof lerPlanilha>>;
     try {
-      const { aba, extracao } = await lerPlanilha(file);
-      setAba(aba);
-      setExtracao(extracao);
-      if (extracao.linhas.length === 0) {
-        toast.warning('Nenhuma linha com "Sim" ou "Não" na coluna VAMOS RECURSAR?');
-        return;
-      }
-      await mutation.mutateAsync({
-        estabelecimentoId,
-        convenioId: convenio !== "todos" ? parseInt(convenio) : undefined,
-        aplicar: false,
-        linhas: extracao.linhas,
-      });
+      lida = await lerPlanilha(file);
     } catch (e: any) {
-      toast.error(e?.message || "Erro ao ler a planilha");
+      // Erro local de leitura do arquivo (gerado neste módulo/biblioteca, sem dados do servidor).
+      toast.error(e instanceof Error && /VAMOS RECURSAR/.test(e.message) ? e.message : "Não foi possível ler a planilha.");
       setExtracao(null);
-    } finally {
       setLendo(false);
+      return;
     }
+    setAba(lida.aba);
+    setExtracao(lida.extracao);
+    setLendo(false);
+    if (lida.extracao.linhas.length === 0) {
+      toast.warning('Nenhuma linha com "Sim" ou "Não" na coluna VAMOS RECURSAR?');
+      return;
+    }
+    // Se o escopo mudou durante a leitura, analisa no escopo vigente.
+    const escopoVigente = escopoAtualRef.current;
+    if (escopoVigente) await analisar(lida.extracao.linhas, escopoVigente);
   };
 
   const reanalisar = async () => {
-    if (!extracao?.linhas.length || !estabelecimentoId) return;
-    try {
-      await mutation.mutateAsync(montarPayload(false));
-    } catch (e: any) {
-      toast.error(e?.message || "Erro ao analisar a planilha");
-    }
+    const escopo = escopoAtualRef.current;
+    if (!extracao?.linhas.length || !escopo) return;
+    await analisar(extracao.linhas, escopo);
   };
 
+  const previa = previaAplicavel(previaEstado, escopoAtual, extracao?.linhas) ? previaEstado.dados : null;
+  const previaDesatualizada = !!extracao && extracao.linhas.length > 0 && !previa && !lendo && !mutation.isPending;
+
   const aplicar = async () => {
-    if (!extracao?.linhas.length || !estabelecimentoId) return;
+    const atual = previaEstado;
+    if (!previaAplicavel(atual, escopoAtualRef.current, extracao?.linhas) || atual.dados.casados === 0) {
+      invalidarPrevia();
+      toast.error("A prévia não corresponde ao hospital/convênio selecionado. Reanalise a planilha.");
+      return;
+    }
+    const seq = ++seqRef.current;
     try {
-      const r = await mutation.mutateAsync(montarPayload(true));
+      // Confirma exatamente o escopo e a planilha analisados, com o token da prévia.
+      const r = await mutation.mutateAsync({
+        estabelecimentoId: atual.escopo.estabelecimentoId,
+        convenioId: atual.escopo.convenioId ?? undefined,
+        aplicar: true,
+        tokenPrevia: atual.tokenPrevia,
+        linhas: atual.linhas,
+      });
+      if (seq !== seqRef.current) return;
+      if (r.aplicados !== atual.dados.casados) {
+        invalidarPrevia();
+        toast.error("A aplicação não confirmou todos os itens da prévia. Reanalise a planilha.");
+        onImportado?.();
+        return;
+      }
       toast.success(`${r.aplicados} decisão(ões) importada(s): ${r.aRecursar} a recursar, ${r.aAceitar} glosa(s) aceita(s).`);
       onImportado?.();
       onOpenChange(false);
       resetar();
-    } catch (e: any) {
-      toast.error(e?.message || "Erro ao aplicar as decisões");
+    } catch (e) {
+      if (seq !== seqRef.current) return;
+      if (exigeNovaAnalise(e)) invalidarPrevia();
+      toast.error(mensagemErroSegura(e, "Não foi possível aplicar as decisões. Nenhuma alteração foi gravada."));
     }
+  };
+
+  const fechar = () => {
+    if (ocupado) return;
+    onOpenChange(false);
+    resetar();
   };
 
   const naoEncontrados = previa?.resultados.filter((r) => r.status !== "casado") ?? [];
   const jaClassificados = previa?.resultados.filter((r) => r.status === "casado" && r.classificacaoAtual && r.classificacaoAtual !== "pendente").length ?? 0;
-  const ocupado = lendo || mutation.isPending;
 
   return (
     <Dialog
       open={open}
       onOpenChange={(o) => {
-        if (!ocupado) {
-          onOpenChange(o);
-          if (!o) resetar();
-        }
+        if (o) onOpenChange(true);
+        else fechar();
       }}
     >
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
@@ -185,7 +267,7 @@ export function ImportarDecisoesGlosaDialog({
               id="importar-decisoes-arquivo"
               type="file"
               accept=".xlsx,.xls"
-              disabled={ocupado || !estabelecimentoId}
+              disabled={ocupado || !escopoAtual}
               onChange={(e) => handleArquivo(e.target.files?.[0])}
             />
           </div>
@@ -213,8 +295,14 @@ export function ImportarDecisoesGlosaDialog({
           </div>
         )}
 
+        {previaDesatualizada && (
+          <p role="status" className="text-xs text-amber-700" data-testid="previa-desatualizada">
+            Prévia indisponível para o hospital/convênio selecionado. Clique em Reanalisar antes de aplicar.
+          </p>
+        )}
+
         {previa && (
-          <div className="space-y-3">
+          <div className="space-y-3" data-testid="previa-decisoes">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
               <div className="rounded-lg border p-2">
                 <div className="text-xs text-muted-foreground">Vinculados</div>
@@ -284,11 +372,11 @@ export function ImportarDecisoesGlosaDialog({
         )}
 
         <DialogFooter className="gap-2">
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={ocupado}>
+          <Button variant="outline" onClick={fechar} disabled={ocupado}>
             Cancelar
           </Button>
           {extracao && extracao.linhas.length > 0 && (
-            <Button variant="outline" onClick={reanalisar} disabled={ocupado}>
+            <Button variant="outline" onClick={reanalisar} disabled={ocupado || !escopoAtual}>
               <Upload className="h-4 w-4 mr-2" /> Reanalisar
             </Button>
           )}
